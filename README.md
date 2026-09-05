@@ -17,6 +17,7 @@ precios de LLMs desde varias fuentes y los sirve de tres maneras:
 | Portkey | `pricing/{provider}.json` + `general/{provider}.json` | Fichas de productos y proveedores |
 | CloudPrice | `ai.cloudprice.net/api/v1` (flat map + catálogo) | Precios y capacidades, aliases |
 | OpenRouter | `GET /models` | Slug canónico, precios, context window, descripción |
+| LiveBench | `livebench.ai/table_YYYY_MM_DD.csv` (la más reciente, vía GitHub) | Puntuaciones reales (54 modelos): overall, coding, agentic coding, reasoning, math... |
 | **Tu LiteLLM** | `/v1/model/info` (fallback `/v1/models`) | Modelos de tus instancias + modelo origen (`litellm_params.model`) |
 | **Tu OpenWebUI** | `/api/models/list` + detalle en `info` | Modelos/agentes de tu instancia + `base_model_id` y descripción |
 
@@ -51,6 +52,17 @@ Los campos `base_model_id`, `resolved_price_from` y `resolved_context_from` se
 exponen en la API REST y MCP. En el cost map LiteLLM estos modelos ya aparecen
 con su precio y ventana derivados.
 
+### Puntuaciones de benchmarks (LiveBench)
+
+El fetcher de LiveBench descarga la tabla mensual más reciente (detección por
+GitHub con fallback) y calcula 8 ejes: `overall`, `coding`, `agentic_coding`,
+`reasoning`, `math`, `data_analysis`, `language` e `instruction_following`.
+Cada fila se engancha al modelo correspondiente con un **matching por firma**
+(letras como conjunto, dígitos de versión como tupla ordenada): tolera
+`claude-opus-4-5` vs `claude-4-5-opus`, pero nunca confunde `gpt-4.5` con
+`gpt-5.4` ni etiqueta variantes (codex/nano/chat) con la puntuación de la
+familia. El resultado queda en `model.benchmarks.livebench`.
+
 ### Prioridad de precios
 
 OpenRouter > CloudPrice > Portkey > LiteLLM upstream.
@@ -71,6 +83,9 @@ OPENWEBUI_API_KEY=sk-...
 # OpenRouter (opcional)
 OPENROUTER_API_URL=https://openrouter.ai/api/v1
 OPENROUTER_API_KEY=sk-or-...
+
+# LiveBench (opcional; por defecto detecta la tabla mensual más reciente)
+# LIVEBENCH_TABLE_URL=https://livebench.ai/table_2026_06_25.csv
 
 # Cache / refresh
 REFRESH_INTERVAL_SECONDS=3600
@@ -111,6 +126,7 @@ recopilar todas las fuentes).
 | `GET /models?q=&provider=&mode=&user_instances=&page=&per_page=` | Lista/búsqueda |
 | `GET /models/{slug}` | Detalle completo de un modelo (slash separado: `/models/openai/gpt-4o`) |
 | `GET /models/{slug}/litellm` | Entrada del modelo en formato cost-map LiteLLM |
+| `GET /models/top` | Top 'n' por score de LiveBench con filtros (ver abajo) |
 | `GET /model?slug=openai/gpt-4o` | Lookup por query string (alternativa a la ruta con slash) |
 | `GET /litellm-cost-map?user_only=` | Cost map completo (cada variante con su precio) |
 | `GET /litellm-proxy` | Config de LiteLLM proxy para usar el cost map |
@@ -127,6 +143,13 @@ curl "http://localhost:8000/models/openai/gpt-4o-2024-08-06"
 
 # Cost map solo de modelos disponibles en tus instancias
 curl "http://localhost:8000/litellm-cost-map?user_only=true"
+
+# Top 10 para codificación agéntica (por score LiveBench)
+curl "http://localhost:8000/models/top?top=10&axis=agentic_coding&dedupe=model"
+
+# Top por valor: agentic coding bueno y barato, en rango de precio, ventana >= 200k
+# y con tooling nativo (function calling + structured outputs + razonamiento)
+curl "http://localhost:8000/models/top?axis=agentic_coding&sort_by=value&dedupe=model&max_output_per_1m=3&min_context_tokens=200000&capabilities=function_calling&capabilities=structured_outputs&capabilities=reasoning"
 ```
 
 El cost map se puede apuntar desde tu LiteLLM proxy:
@@ -139,6 +162,23 @@ model_list:
     model_info:
       cost_map_url: http://localhost:8000/litellm-cost-map?user_only=true
 ```
+
+### `/models/top` — selección por capacidades
+
+| Parámetro | Uso |
+|-----------|-----|
+| `top` | Cuántos devolver (1-200) |
+| `axis` | Eje de LiveBench: `overall`, `coding`, `agentic_coding`, `reasoning`, `math`, `data_analysis`, `language`, `instruction_following` (def. `agentic_coding`) |
+| `min_score` | Score mínimo en ese eje |
+| `min_context_tokens` | Ventana mínima (usa `max_input_tokens` o `context_length`) |
+| `max_input_per_1m` / `max_output_per_1m` | Rango de precio, USD por millón de tokens |
+| `capabilities` | Capacidades requeridas (repetible; todas deben ser true): `function_calling`, `structured_outputs`, `reasoning`, `code_execution`... |
+| `sort_by` | `score` (eje desc), `price` (output asc), `value` (score / $/1M output) |
+| `dedupe` | `model` colapsa variantes regionales/gateway/instancia que comparten `livebench_id` |
+| `q`, `provider`, `mode`, `user_instances` | Mismos filtros del listado |
+
+Cada item devuelve `score`, `value_score`, `price_per_1m` y el modelo serializado
+(con `benchmarks`, capacidades y precios) para decidir en detalle.
 
 ## MCP
 
@@ -179,18 +219,19 @@ app/
   config.py             # Settings desde .env
   state.py              # AppState: fetch concurrente, merge, refresh periódico
   cache.py              # TTL cache en memoria
-  models.py             # ModelData, SourcePayload, SourceStatus
-  merge.py              # Dedup (union-find), fusión de precios/capacidades, variantes
+  models.py             # ModelData (con benchmarks), SourcePayload, SourceStatus
+  merge.py              # Dedup, fusión, variantes y enganche de benchmarks (LiveBench)
   fetchers/
     base.py             # Fetcher base con retries (sin retry en 4xx)
     litellm_upstream.py # GitHub json oficial de LiteLLM
     portkey.py          # pricing/general por provider (paralelo, Sin retry 4xx)
     cloudprice.py       # ai.cloudprice.net: flat map + catálogo con aliases
     openrouter.py       # GET /models con paginación
+    livebench.py        # Scores LiveBench (tabla mensual más reciente)
     litellm_user.py     # tu proxy: /v1/model/info, /v1/models, /v1/model_group/info
     openwebui.py        # /api/models/list + detalle por modelo (rate-limited)
   api/
-    routes.py           # REST endpoints
+    routes.py           # REST endpoints (incl. /models/top)
     litellm_format.py   # Conversión a model_prices_and_context_window.json
   mcp/server.py         # FastMCP con tools list/search/get_details
 ```

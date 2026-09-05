@@ -53,6 +53,79 @@ class ModelInfoMCP:
                 return f"Model '{slug}' not found."
             return _format_model(model)
 
+        @self.mcp.tool()
+        def top_models(
+            top: int = 10,
+            axis: str = "agentic_coding",
+            min_score: float | None = None,
+            min_context_tokens: int | None = None,
+            out_price_per_1m: float | None = None,
+            capabilities: list[str] | None = None,
+            sort_by: str = "score",
+            dedupe: bool = False,
+        ) -> str:
+            """Recommend models for a task by LiveBench benchmark score with optional filters.
+
+            axis: overall, coding, agentic_coding, reasoning, math, data_analysis,
+            language, instruction_following. Filters: min_score (0-100),
+            min_context_tokens (window), out_price_per_1m (max USD / 1M output
+            tokens), capabilities (e.g. ['function_calling','structured_outputs']),
+            sort_by: score|price|value, dedupe: collapse provider variants.
+            """
+            cap_list = [] if capabilities is None else [
+                c if c.startswith("supports_") else f"supports_{c}" for c in capabilities
+            ]
+            rows: list[tuple] = []
+            for m in state.models:
+                lb = (m.benchmarks or {}).get("livebench") or {}
+                score = lb.get(axis)
+                if score is None:
+                    continue
+                if min_score is not None and score < min_score:
+                    continue
+                if cap_list and any(not m.capabilities.get(c) for c in cap_list):
+                    continue
+                if min_context_tokens is not None and (
+                    (m.max_input_tokens or m.context_length or 0) < min_context_tokens
+                ):
+                    continue
+                out_1m = None
+                v = m.pricing.get("output_cost_per_token")
+                if isinstance(v, (int, float)):
+                    out_1m = v * 1_000_000
+                if out_price_per_1m is not None and (out_1m is None or out_1m > out_price_per_1m):
+                    continue
+                value = (score / out_1m) if out_1m else None
+                rows.append((m, round(score, 1), out_1m, value, lb.get("livebench_id", "")))
+
+            if sort_by == "price":
+                rows.sort(key=lambda r: (r[2] is None, r[2] or float("inf")))
+            elif sort_by == "value":
+                rows.sort(key=lambda r: (r[3] is None, -(r[3] or 0)))
+            else:
+                rows.sort(key=lambda r: (-r[1], r[2] or float("inf")))
+
+            if dedupe:
+                seen: set[str] = set()
+                kept: list = []
+                for r in rows:
+                    if r[4] in seen:
+                        continue
+                    seen.add(r[4])
+                    kept.append(r)
+                rows = kept
+
+            lines = [f"Top {top} by {axis} (sort={sort_by}):"]
+            for m, score, out_1m, value, lbid in rows[:top]:
+                price = f"${out_1m:.3f}" if out_1m is not None else "n/a"
+                val = f" value={value:.1f}" if value is not None else ""
+                ctx = m.max_input_tokens or m.context_length
+                lines.append(
+                    f"- {m.canonical_slug} | {axis}={score} | out$/1M={price}{val}"
+                    f" | ctx={ctx}"
+                )
+            return "\n".join(lines)
+
     def format_model(self, model) -> str:
         return _format_model(model)
 
@@ -103,7 +176,25 @@ def _format_model(model) -> str:
         parts.append("Pricing derived from: " + model.resolved_price_from)
     if model.resolved_context_from:
         parts.append("Context window derived from: " + model.resolved_context_from)
+    if model.benchmarks.get("livebench"):
+        lb = model.benchmarks["livebench"]
+        parts.append(
+            "LiveBench ("
+            + lb.get("table", "?")
+            + "): overall="
+            + _fmt_score(lb.get("overall"))
+            + ", agentic_coding="
+            + _fmt_score(lb.get("agentic_coding"))
+            + ", coding="
+            + _fmt_score(lb.get("coding"))
+            + ", reasoning="
+            + _fmt_score(lb.get("reasoning"))
+        )
     return "\n".join(parts)
+
+
+def _fmt_score(v) -> str:
+    return "n/a" if v is None else f"{v:g}"
 
 
 def create_mcp(state: AppState) -> FastMCP:

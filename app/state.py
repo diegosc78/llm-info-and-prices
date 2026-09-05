@@ -8,6 +8,7 @@ from .cache import TTLCache
 from .config import Settings, get_settings
 from .fetchers import (
     CloudPriceFetcher,
+    LiveBenchFetcher,
     LiteLLMUpstreamFetcher,
     LiteLLMUserFetcher,
     OpenRouterFetcher,
@@ -40,6 +41,7 @@ class AppState:
             PortkeyFetcher(self.settings),
             CloudPriceFetcher(self.settings),
             OpenRouterFetcher(self.settings),
+            LiveBenchFetcher(self.settings),
             LiteLLMUserFetcher(self.settings),
             OpenWebUIFetcher(self.settings),
         ]

@@ -17,6 +17,7 @@ SOURCE_LABEL = {
     "portkey": "Portkey",
     "cloudprice": "CloudPrice",
     "openrouter": "OpenRouter",
+    "livebench": "LiveBench",
     "litellm_user": "NUESTROS modelos LiteLLM",
     "openwebui": "NUESTROS modelos OpenWebUI",
 }
@@ -109,6 +110,9 @@ class MergeEngine:
             model = self._merge_cluster(cluster, items, cloudprice_alias_map)
             if model is not None:
                 result.append(model)
+
+        # ----- Pass 4: attach benchmark scores (LiveBench) by id matching -----
+        self._attach_benchmarks(result, self.payloads)
 
         logger.info("merge: %d clusters from %d items", len(result), len(items))
         return result
@@ -612,3 +616,104 @@ class MergeEngine:
             "video": "chat",
         }
         return mapping.get(m, m)
+
+    # ------------------------------------------------------------------
+    # Benchmark (LiveBench) attachment
+    # ------------------------------------------------------------------
+    def _attach_benchmarks(
+        self,
+        models: list[ModelData],
+        payloads: list[SourcePayload],
+    ) -> None:
+        """Attach LiveBench scores to merged models by fuzzy id matching.
+
+        LiveBench ids (e.g. claude-opus-4-5-20251101-thinking-64k-high-effort)
+        never match a canonical slug exactly, so they are token-normalized and
+        matched against each model's slug/alias tokens (stem first).
+        """
+        lb_payload = next((p for p in payloads if p.name == "livebench"), None)
+        if lb_payload is None or not lb_payload.items:
+            return
+        rows = [
+            {**row, "_tokens": _clean_tokens(row.get("livebench_id") or "")}
+            for row in lb_payload.items.values()
+        ]
+        matched = 0
+        for model in models:
+            row = _best_livebench_match(model, rows)
+            if row is None:
+                continue
+            score = dict(row)
+            score.pop("_tokens", None)
+            model.benchmarks["livebench"] = score
+            matched += 1
+        logger.info("merge: livebench scores attached to %d/%d models",
+                    matched, len(models))
+
+
+_STOP_TOKENS = {
+    "latest", "preview", "thinking", "reasoning", "effort",
+    "high", "medium", "low", "xhigh", "xlow", "auto",
+    "beta", "experimental", "api", "chat", "instruct", "finetune", "turbo",
+}
+_DATE_RE = re.compile(r"\d{4,8}\b")
+_SIZE_RE = re.compile(r"\d+[kmb]\b")
+_ISO_DATE_RE = re.compile(r"-\d{8}\b|-\d{4}-\d{2}-\d{2}\b")
+
+
+def _clean_tokens(v: str) -> tuple[frozenset[str], tuple[str, ...]]:
+    """Normalize a model id to a comparable signature for benchmark matching.
+
+    Signature = (letter tokens as a set, version digits as an ORDERED tuple).
+    Letters are order-free so claude-opus-4-5 matches claude-4-5-opus, while
+    version digits keep their order so gpt-4.5 is never confused with gpt-5.4
+    and gpt-5.5 stays distinct from gpt-5. Deployment suffixes (chat/preview/
+    thinking/high-effort/dates) are dropped as noise.
+    """
+    v = (v or "").lower()
+    v = _ISO_DATE_RE.sub("", v)  # drop -2025-12-11 / -20251101 chunks before tokenizing
+    letters: set[str] = set()
+    digits: list[str] = []
+    for t in re.findall(r"[a-z0-9]+", v):
+        if t in _STOP_TOKENS:
+            continue
+        if _DATE_RE.fullmatch(t):
+            continue
+        if _SIZE_RE.fullmatch(t):
+            continue
+        if t.isdigit():
+            digits.append(t)
+        else:
+            letters.add(t)
+    return frozenset(letters), tuple(digits)
+
+
+def _best_livebench_match(
+    model: ModelData, rows: list[dict]
+) -> dict | None:
+    stems: list[tuple] = []
+    fulls: list[tuple] = []
+    for key in [model.canonical_slug, model.canonical_slug.replace("/", "-"), *model.aliases.keys()]:
+        if not key:
+            continue
+        seg = key.split("/")[-1]
+        fulls.append(_clean_tokens(key))
+        stems.append(_clean_tokens(seg))
+
+    best: dict | None = None
+    best_key: tuple = (0, "")
+    for row in rows:
+        c = row["_tokens"]
+        if not c or not any(c):
+            continue
+        # Only exact signature equality against the canonical slug / its stem
+        # or any alias stem/full id. Subset/"family" matching is deliberately
+        # avoided: it would mislabel variants (codex/nano/...) with the family
+        # score, and unordered token sets would confuse gpt-5.4 with gpt-4.5.
+        if not (any(c == s for s in stems) or any(c == f for f in fulls)):
+            continue
+        key = (len(c[0]) + len(c[1]), row.get("livebench_id") or "")
+        if key > best_key:
+            best_key = key
+            best = row
+    return best

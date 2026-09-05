@@ -60,6 +60,10 @@ class ModelData(BaseModel):
     # e.g. azure/eu/gpt-4o... carries its own rates from the cloudprice flat map.
     litellm_variants: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
+    # Benchmark scores (e.g. LiveBench): source -> {overall, category scores}.
+    # Used by /models/top for capability-ranked model selection.
+    benchmarks: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
     # URL / docs metadata
     urls: dict[str, str] = Field(default_factory=dict)
 

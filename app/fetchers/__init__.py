@@ -5,6 +5,7 @@ from .cloudprice import CloudPriceFetcher
 from .openrouter import OpenRouterFetcher
 from .litellm_user import LiteLLMUserFetcher
 from .openwebui import OpenWebUIFetcher
+from .livebench import LiveBenchFetcher
 
 __all__ = [
     "BaseFetcher",
@@ -15,4 +16,5 @@ __all__ = [
     "OpenRouterFetcher",
     "LiteLLMUserFetcher",
     "OpenWebUIFetcher",
+    "LiveBenchFetcher",
 ]

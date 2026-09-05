@@ -25,6 +25,9 @@ class Settings(BaseSettings):
     openrouter_api_url: str = "https://openrouter.ai/api/v1"
     openrouter_api_key: str | None = None
 
+    # ---- LiveBench benchmarks (optional override; default = newest monthly table) ----
+    livebench_table_url: str | None = None
+
     # ---- Refresh / cache ----
     refresh_interval_seconds: int = 3600
     cache_ttl_seconds: int = 3600

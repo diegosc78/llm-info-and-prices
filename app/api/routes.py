@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
@@ -10,6 +10,20 @@ from ..state import AppState
 from .litellm_format import to_litellm_cost_map, to_litellm_entry
 
 router = APIRouter()
+
+# LiveBench score axes exposed by /models/top
+BENCH_AXES = (
+    "overall",
+    "coding",
+    "agentic_coding",
+    "reasoning",
+    "math",
+    "data_analysis",
+    "language",
+    "instruction_following",
+)
+
+TOP_SORTS = ("score", "price", "value")
 
 
 def _state(request: Request) -> AppState:
@@ -35,6 +49,7 @@ def _serialize(model: ModelData, include_raw: bool = True) -> dict[str, Any]:
         "base_model_id": model.base_model_id,
         "resolved_price_from": model.resolved_price_from,
         "resolved_context_from": model.resolved_context_from,
+        "benchmarks": dict(model.benchmarks),
         "urls": dict(model.urls),
         "aliases": dict(model.aliases),
         "instances": list(model.instances),
@@ -86,6 +101,157 @@ async def list_models(
         "per_page": per_page,
         "items": items,
     }
+
+
+@router.get("/models/top")
+async def top_models(
+    request: Request,
+    top: int = Query(default=10, ge=1, le=200),
+    axis: Literal[
+        "overall",
+        "coding",
+        "agentic_coding",
+        "reasoning",
+        "math",
+        "data_analysis",
+        "language",
+        "instruction_following",
+    ] = Query(default="agentic_coding"),
+    min_score: float | None = Query(default=None, ge=0, le=100),
+    min_context_tokens: int | None = Query(default=None, ge=1),
+    max_input_per_1m: float | None = Query(default=None, gt=0),
+    max_output_per_1m: float | None = Query(default=None, gt=0),
+    capabilities: list[str] = Query(
+        default=[],
+        description="Required capabilities (all must be true), e.g. capabilities=function_calling&capabilities=structured_outputs",
+    ),
+    sort_by: Literal["score", "price", "value"] = Query(default="score"),
+    dedupe: Literal["none", "model"] = Query(
+        default="none",
+        description="'model' collapses regional/gateway variants that share the same underlying model, keeping the best",
+    ),
+    q: str | None = Query(default=None),
+    provider: str | None = Query(default=None),
+    mode: str | None = Query(default=None),
+    user_instances: bool | None = Query(default=None),
+) -> dict[str, Any]:
+    """Top 'n' models by benchmark score within price/window/capability filters.
+
+    Ranked selection for agentic coding etc.: filters by price range (per 1M
+    tokens), minimum context window, required capabilities (function calling,
+    structured outputs, ...) and minimum benchmark score; scores come from
+    LiveBench (attached by model-id matching in the merge).
+    """
+    state = _state(request)
+    matched = state.search(q=q, provider=provider, mode=mode, user_instances=user_instances)
+
+    # Normalize capability names (accept with or without supports_ prefix)
+    req_caps = [
+        c if c.startswith("supports_") else f"supports_{c}"
+        for c in capabilities
+        if c
+    ]
+
+    rows: list[dict[str, Any]] = []
+    for model in matched:
+        lb = model.benchmarks.get("livebench") or {}
+        score = lb.get(axis)
+        if score is None:
+            continue  # only models with the requested benchmark axis qualify
+        if min_score is not None and score < min_score:
+            continue
+        if req_caps and any(not model.capabilities.get(c) for c in req_caps):
+            continue
+        ctx = model.max_input_tokens or model.context_length or 0
+        if min_context_tokens is not None and ctx < min_context_tokens:
+            continue
+        in_1m, out_1m = _price_per_1m(model)
+        if max_input_per_1m is not None and (in_1m is None or in_1m > max_input_per_1m):
+            continue
+        if max_output_per_1m is not None and (out_1m is None or out_1m > max_output_per_1m):
+            continue
+
+        # value = score per unit of cost (default: $/1M output tokens)
+        base = out_1m if out_1m is not None else in_1m
+        value = round(score / base, 3) if (score is not None and base) else None
+        rows.append(
+            {
+                "model": _serialize(model, include_raw=False),
+                "score": round(score, 1),
+                "value_score": value,
+                "price_per_1m": {"input": in_1m, "output": out_1m},
+            }
+        )
+
+    if not rows:
+        return _top_response(axis, sort_by, top, matched, filtered=0, items=[])
+
+    if sort_by == "price":
+        rows.sort(key=lambda r: (r["price_per_1m"]["output"] is None,
+                                 r["price_per_1m"]["output"] or float("inf"),
+                                 r["price_per_1m"]["input"] or float("inf")))
+    elif sort_by == "value":
+        rows.sort(key=lambda r: (r["value_score"] is None, -(r["value_score"] or 0)))
+    else:  # score
+        rows.sort(key=lambda r: (-r["score"],
+                                 r["price_per_1m"]["output"] or float("inf")))
+
+    if dedupe == "model":
+        rows = _dedupe_by_model(rows)
+
+    return _top_response(axis, sort_by, top, matched, filtered=len(rows), items=rows[:top])
+
+
+def _dedupe_by_model(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse regional/gateway/user variants of the same benchmarked model.
+
+    Every row in /models/top carries a LiveBench id (that's what qualified it);
+    rows sharing that id are the same underlying model exposed under different
+    provider/gateway/instance slugs. The top-ranked one is kept and the
+    alias-slugs of the rest are merged into it.
+    """
+    seen: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        lb = row["model"].get("benchmarks", {}).get("livebench")
+        key = (lb or {}).get("livebench_id")
+        if not key:
+            continue
+        if key not in seen:
+            seen[key] = row
+        else:
+            merged_aliases = seen[key]["model"].setdefault("aliases", {})
+            for a, s in row["model"].get("aliases", {}).items():
+                merged_aliases.setdefault(a, s)
+    return list(seen.values())
+
+
+def _top_response(
+    axis: str,
+    sort_by: str,
+    top: int,
+    matched: list[ModelData],
+    filtered: int,
+    items: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "axis": axis,
+        "sort_by": sort_by,
+        "top": top,
+        "total_considered": len(matched),
+        "total_qualified": filtered,
+        "returned": len(items),
+        "items": items,
+    }
+
+
+def _price_per_1m(model: ModelData) -> tuple[float | None, float | None]:
+    def one(side: str) -> float | None:
+        v = model.pricing.get(f"{side}_cost_per_token")
+        if isinstance(v, (int, float)):
+            return round(v * 1_000_000, 6)
+        return None
+
+    return one("input"), one("output")
 
 
 @router.get("/model")
