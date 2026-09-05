@@ -17,12 +17,39 @@ precios de LLMs desde varias fuentes y los sirve de tres maneras:
 | Portkey | `pricing/{provider}.json` + `general/{provider}.json` | Fichas de productos y proveedores |
 | CloudPrice | `ai.cloudprice.net/api/v1` (flat map + catálogo) | Precios y capacidades, aliases |
 | OpenRouter | `GET /models` | Slug canónico, precios, context window, descripción |
-| **Tu LiteLLM** | `/v1/model/info` (fallback `/v1/models`) | Modelos de tus instancias |
-| **Tu OpenWebUI** | `/api/models/list` + `/api/models/model?id=` | Modelos y agentes de tu instancia |
+| **Tu LiteLLM** | `/v1/model/info` (fallback `/v1/models`) | Modelos de tus instancias + modelo origen (`litellm_params.model`) |
+| **Tu OpenWebUI** | `/api/models/list` + detalle en `info` | Modelos/agentes de tu instancia + `base_model_id` y descripción |
 
 Los modelos de tus instancias (LiteLLM + OpenWebUI) se fusionan con los de las
 fuentes públicas: si el mismo modelo existe en abierto, hereda la información/price
 pública y queda marcado como `instances: ["litellm_user", "openwebui"]`.
+
+### Resolución de modelo base (precios subyacentes)
+
+Los modelos personalizados/agentes y los aliases de tu proxy no tienen precio propio,
+pero sí un **modelo base/origen**:
+
+- OpenWebUI: `info.base_model_id` (el modelo que el agente usa por debajo).
+- LiteLLM: `litellm_params.model` (el modelo origen del proxy).
+
+Se sigue la cadena recursivamente hasta un modelo con datos reales y se heredan:
+- **Precios** del eslabón más profundo que tenga alguno.
+- **Ventana de contexto** (`context_length`, `max_input_tokens`, `max_output_tokens`)
+  y `litellm_provider` del eslabón más profundo que los tenga.
+
+Solo se rellena lo que falte; nunca se sobreescribe un valor propio.
+Ejemplo real:
+
+```
+traductor-tecnlogo (OpenWebUI) -> base_model_id: openrouter/google/gemini-3-flash-preview
+  => pricing: input 5e-7, output 3e-6  (pricing_source: "derived from openrouter/google/gemini-3-flash-preview")
+  => window: max_input_tokens 1048576, max_output_tokens 65536
+     (resolved_context_from: openrouter/google/gemini-3-flash-preview)
+```
+
+Los campos `base_model_id`, `resolved_price_from` y `resolved_context_from` se
+exponen en la API REST y MCP. En el cost map LiteLLM estos modelos ya aparecen
+con su precio y ventana derivados.
 
 ### Prioridad de precios
 

@@ -51,6 +51,11 @@ class LiteLLMUserFetcher(BaseFetcher):
                     continue
                 entry = dict(item)
                 entry["litellm_proxy_model_name"] = name
+                # The actual upstream model id behind the public proxy name.
+                lp = item.get("litellm_params") or {}
+                origin = lp.get("model") if isinstance(lp, dict) else None
+                if isinstance(origin, str) and origin and origin.lower() != name.lower():
+                    entry["origin_model_id"] = origin
                 items[name] = entry
         except Exception as exc:  # noqa: BLE001
             info_error = exc

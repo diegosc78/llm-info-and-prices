@@ -14,7 +14,7 @@ from .fetchers import (
     OpenWebUIFetcher,
     PortkeyFetcher,
 )
-from .merge import MergeEngine
+from .merge import MergeEngine, normalize_id
 from .models import ModelData, SourcePayload, SourceStatus
 
 logger = logging.getLogger(__name__)
@@ -87,6 +87,7 @@ class AppState:
                 self.sources[f.name] = f.status
             merged = MergeEngine([p for p in results if p is not None]).build()
             self.models = merged
+            self._resolve_base_prices()
 
         logger.info(
             "refresh complete: %d models, %d/%d sources ok",
@@ -95,6 +96,118 @@ class AppState:
             len(self.sources),
         )
         return dict(self.sources)
+
+    # context-window fields inherited from a base model when missing
+    _WINDOW_FIELDS = (
+        "context_length",
+        "max_input_tokens",
+        "max_output_tokens",
+        "litellm_provider",
+    )
+
+    def _resolve_base_prices(self) -> None:
+        """Resolve custom/proxy models to their underlying base model and
+        inherit its pricing and context-window data.
+
+        Chains like OpenWebUI 'traductor-tecnlogo' -> base 'migemini-2.5-flash'
+        (LiteLLM proxy) -> origin 'openrouter/google/gemini-2.5-flash' are
+        followed recursively until a model with concrete data is found. Pricing
+        is filled from the deepest link that has any, and window metadata
+        (max_input_tokens, max_output_tokens, context_length, litellm_provider)
+        from the deepest link that carries it. Existing values are never
+        overwritten, only inherited when missing.
+        """
+        if not self.models:
+            return
+
+        lookup: dict[str, ModelData] = {}
+        for m in self.models:
+            lookup[normalize_id(m.canonical_slug)] = m
+            for a in m.aliases:
+                lookup.setdefault(normalize_id(a), m)
+
+        logger.info("resolving base-model price/context chains over %d models", len(self.models))
+
+        for m in self.models:
+            chain = self._base_chain(m, lookup)
+
+            # deepest link of the chain with concrete pricing / window data
+            price_target = next((c for c in reversed(chain) if c.pricing), None)
+            window_target = next(
+                (
+                    c
+                    for c in reversed(chain)
+                    if any(getattr(c, f) for f in self._WINDOW_FIELDS)
+                ),
+                None,
+            )
+            if price_target is None and window_target is None:
+                continue
+
+            for c in chain:
+                self._inherit_price(c, price_target)
+                self._inherit_window(c, window_target)
+
+    def _base_chain(
+        self,
+        m: ModelData,
+        lookup: dict[str, ModelData],
+    ) -> list[ModelData]:
+        chain: list[ModelData] = []
+        cur: ModelData | None = m
+        seen: set[str] = set()
+        while cur is not None:
+            if cur.canonical_slug in seen:
+                break  # cycle guard
+            seen.add(cur.canonical_slug)
+            chain.append(cur)
+            base = cur.base_model_id
+            if not base:
+                break
+            b = lookup.get(normalize_id(base))
+            if b is None:
+                stripped = self._strip_doubled_provider(base)
+                if stripped and stripped != normalize_id(base):
+                    b = lookup.get(stripped)
+            if b is None:
+                break
+            cur = b
+        return chain
+
+    @staticmethod
+    def _inherit_price(c: ModelData, target: ModelData | None) -> None:
+        if target is None or c is target:
+            return
+        added = False
+        for k, v in target.pricing.items():
+            if k not in c.pricing:
+                c.pricing[k] = v
+                c.pricing_source[k] = f"derived from {target.canonical_slug}"
+                added = True
+        if added:
+            c.resolved_price_from = target.canonical_slug
+
+    @classmethod
+    def _inherit_window(cls, c: ModelData, target: ModelData | None) -> None:
+        if target is None or c is target:
+            return
+        derived = False
+        for f in cls._WINDOW_FIELDS:
+            cur = getattr(c, f, None)
+            val = getattr(target, f, None)
+            if cur is None and val:
+                setattr(c, f, val)
+                derived = True
+        if derived:
+            c.resolved_context_from = target.canonical_slug
+
+    @staticmethod
+    def _strip_doubled_provider(v: str) -> str:
+        """openai/openai/gpt-oss-20b -> openai/gpt-oss-20b (noise in proxies)."""
+        parts = normalize_id(v).split("/")
+        if len(parts) >= 3 and parts[0] == parts[1]:
+            return "/".join(parts[1:])
+        return normalize_id(v)
 
     async def _periodic_refresh(self) -> None:
         interval = self.settings.refresh_interval_seconds

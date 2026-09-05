@@ -75,6 +75,16 @@ def _format_model(model) -> str:
             src = model.pricing_source.get(k, "?")
             price_lines.append(f"  {k} = {v} (from {src})")
         parts.append("Pricing:\n" + "\n".join(price_lines))
+    if model.context_length or model.max_input_tokens or model.max_output_tokens:
+        win = [
+            f"context_length={model.context_length}"
+            if model.context_length else None,
+            f"max_input_tokens={model.max_input_tokens}"
+            if model.max_input_tokens else None,
+            f"max_output_tokens={model.max_output_tokens}"
+            if model.max_output_tokens else None,
+        ]
+        parts.append("Context window: " + ", ".join(w for w in win if w))
     if model.capabilities:
         caps = ", ".join(
             f"{k.replace('supports_', '')}={str(v).lower()}"
@@ -87,6 +97,12 @@ def _format_model(model) -> str:
         parts.append("Aliases:\n" + "\n".join(f"  {a} ({s})" for a, s in sorted(model.aliases.items())))
     if model.instances:
         parts.append("Available on your instances: " + ", ".join(model.instances))
+    if model.base_model_id:
+        parts.append("Base / origin model: " + model.base_model_id)
+    if model.resolved_price_from:
+        parts.append("Pricing derived from: " + model.resolved_price_from)
+    if model.resolved_context_from:
+        parts.append("Context window derived from: " + model.resolved_context_from)
     return "\n".join(parts)
 
 

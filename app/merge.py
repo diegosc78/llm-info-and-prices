@@ -207,12 +207,43 @@ class MergeEngine:
                 )
                 if lt_model:
                     model.aliases.setdefault(str(lt_model), source)
+                mi = entry.get("model_info") or {}
+                if mi.get("litellm_provider"):
+                    model.litellm_provider = mi["litellm_provider"]
                 model.instances.append("litellm_user")
             elif source == "openwebui":
+                info = entry.get("info") or {}
+                meta = info.get("meta") or {}
+                name = info.get("name") or entry.get("name")
+                desc = meta.get("description") or entry.get("description")
+                if name:
+                    model.display_name = name or model.display_name
+                if desc:
+                    model.description = desc or model.description
                 model.instances.append("openwebui")
 
         if not model.provider:
             model.provider = provider_from_id(slug, "unknown")
+
+        # ----- Base / origin model capture (OpenWebUI wins, else LiteLLM) -----
+        for source, vid, entry, _ in cluster_items:
+            if source == "openwebui":
+                base = entry.get("base_model_id")
+                if (
+                    isinstance(base, str)
+                    and base
+                    and normalize_id(base) != normalize_id(vid)
+                ):
+                    model.base_model_id = base
+            elif source == "litellm_user":
+                origin = entry.get("origin_model_id")
+                if (
+                    model.base_model_id is None
+                    and isinstance(origin, str)
+                    and origin
+                    and normalize_id(origin) != normalize_id(vid)
+                ):
+                    model.base_model_id = origin
 
         # ----- Merge context windows (take richest but not smaller than others) -----
         max_input = model.max_input_tokens

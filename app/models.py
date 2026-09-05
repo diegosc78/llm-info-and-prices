@@ -43,6 +43,19 @@ class ModelData(BaseModel):
     # Price provenance: pricing key -> source name
     pricing_source: dict[str, str] = Field(default_factory=dict)
 
+    # Underlying/base/origin model id captured from the source (OpenWebUI
+    # base_model_id or LiteLLM litellm_params.model). Used to derive pricing
+    # for custom proxy/agent models via base-model resolution.
+    base_model_id: str | None = None
+
+    # Canonical slug of the model whose pricing was inherited (or added to)
+    # through base-model resolution.
+    resolved_price_from: str | None = None
+
+    # Canonical slug of the model whose context-window data (max_input_tokens,
+    # max_output_tokens, context_length, litellm_provider) was inherited.
+    resolved_context_from: str | None = None
+
     # Per-variant LiteLLM-style pricing entries, keyed by the variant id.
     # e.g. azure/eu/gpt-4o... carries its own rates from the cloudprice flat map.
     litellm_variants: dict[str, dict[str, Any]] = Field(default_factory=dict)
